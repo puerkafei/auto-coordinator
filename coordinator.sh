@@ -29,6 +29,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
+# Auto-load environment secrets (~/.openclaw/.env never pushed to git)
+if [[ -f "$HOME/.openclaw/.env" ]]; then
+  set -a
+  source "$HOME/.openclaw/.env"
+  set +a
+fi
+
 : "${COORDINATOR_LOG:=/tmp/coordinator.log}"
 : "${COORDINATOR_STATUS_DIR:=$(dirname "$0")/../team-share}"
 : "${COORDINATOR_STATUS_FILE:=status.json}"
