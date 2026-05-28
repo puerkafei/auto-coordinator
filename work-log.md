@@ -1,4 +1,4 @@
-# 工作日志 — 貂蝉编码（第6棒）
+# 工作日志 — 貂蝉编码（第6棒） / 上传（第10棒）
 
 **任务**：TASK-20260528-auto-relay（第6棒：编码）
 **父任务**：TASK-20260528-auto-coordinator
@@ -63,6 +63,16 @@ coordinator.sh relay
 | relay_find_next 逻辑对 status.json 实测 | ✅ 通过（completed+reported_next=true → 正确触发 none） |
 | coordinator.sh help 输出 | ✅ 正常 |
 | relay help 输出 | ✅ 正常 |
+
+## 上传记录（第10棒）
+
+- **时间**：2026-05-28 16:53
+- **操作人**：貂蝉（opencode）
+- **仓库**：puerkafei/auto-coordinator
+- **版本**：v2026.05.28.2
+- **上传文件**：coordinator.sh, coordinator.conf, README.md（曹植润色版）, relay.conf, work-log.md
+- **Release 更新**：✅ 已更新 release body（relay module 说明）
+- **Git push**：✅ main + tag
 
 ## 备注
 
