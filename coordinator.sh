@@ -1,6 +1,6 @@
 #!/bin/bash
 # coordinator.sh — Automated Coordination Scheduler
-# <!-- V5 v2026.05.29.1 -->
+# <!-- V5 v2026.05.28.3 -->
 #
 # Polls agent status, detects status.json changes, commits/pushes to git,
 # sends blocker alerts to the master (主公), and manages timed reminders.
@@ -362,21 +362,28 @@ print(json.dumps({
 
 relay_lookup_agent() {
   local role="$1"
-  python3 -c "
-import configparser, sys, json
-conf_path = '${RELAY_CONF}'
-try:
-    config = configparser.ConfigParser()
-    config.read(conf_path)
-    if config.has_section('${role}'):
-        agent_id = config.get('${role}', 'agentId', fallback='')
-        agent_type = config.get('${role}', 'type', fallback='native')
-        print(json.dumps({'agentId': agent_id, 'type': agent_type}))
-    else:
-        print(json.dumps({'error': 'role_not_found', 'role': '${role}'}))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-"
+  local file="${RELAY_CONF}"
+
+  awk -v sec="[$role]" -v q='"' '
+    BEGIN { agentId = ""; type = "native" }
+    $0 == sec          { found=1; next }
+    found && /^\[/     { exit }
+    found && /^agentId[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      agentId = $0
+    }
+    found && /^type[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "")
+      type = $0
+    }
+    END {
+      if (agentId == "") {
+        printf "{\"error\":\"role_not_found\",\"role\":%s%s%s}\n", q, sec, q
+      } else {
+        printf "{\"agentId\":%s%s%s,\"type\":%s%s%s}\n", q, agentId, q, q, type, q
+      }
+    }
+  ' "$file"
 }
 
 relay_notify_step() {
@@ -606,9 +613,33 @@ relay_auto_handler() {
       return 1
       ;;
   esac
+
+  relay_cleanup
 }
 
-# --- 8b. RELAY — CHECK SESSION STATUS (supplementary) ------------------------
+# --- 8b. RELAY — CLEANUP (zombie process reaper) ------------------------------
+relay_cleanup() {
+  local SCRIPT_PID=$$
+  local RELAY_PIDS
+
+  RELAY_PIDS=$(pgrep -P "$SCRIPT_PID" 2>/dev/null)
+
+  for pid in $RELAY_PIDS; do
+    local cmd
+    cmd=$(ps -o cmd= -p "$pid" 2>/dev/null)
+
+    case "$cmd" in
+      *inotifywait*|*sleep*|*coordinator.sh*)
+        kill -TERM "$pid" 2>/dev/null
+        ;;
+      *)
+        echo "skip protected process: pid=$pid cmd=$cmd" >&2
+        ;;
+    esac
+  done
+}
+
+# --- 8c. RELAY — CHECK SESSION STATUS (supplementary) ------------------------
 relay_check_session() {
   local agent_id="$1"
   local previous_ended_at="${2:-}"
