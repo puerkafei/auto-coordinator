@@ -1,8 +1,8 @@
 # Coordinator — Automated Agent Coordination Scheduler
 
-> **Version**: v2026.05.28.1
+> **Version**: v2026.05.28.2
 
-`coordinator.sh` is a shell-based coordination scheduler for OpenClaw multi-agent workflows. It polls agent status, detects `status.json` changes, auto-commits and pushes to git, sends blocker alerts, and manages timed reminders.
+`coordinator.sh` is a shell-based coordination scheduler for OpenClaw multi-agent workflows. It polls agent status, detects `status.json` changes, auto-commits and pushes to git, sends blocker alerts, manages timed reminders, and handles workflow relay (auto handoff between agents).
 
 ## Features
 
@@ -11,6 +11,7 @@
 - **Auto Git Push** — Automatically commits and pushes changes to the configured branch
 - **Blocker Notification** — Multi-channel alerts via `openclaw agent --agent main`, webhook, and Telegram fallback
 - **Timed Reminders** — Supports absolute time (`HH:MM`), relative time (`+10min`), and ISO 8601 timestamps
+- **Workflow Relay** — Auto handoff between agents on task completion, with anti-jump validation
 - **Status Validation** — JSON syntax check and required field validation for `status.json`
 - **Cron Integration** — Built-in `init-cron` command generates recommended crontab entries
 
@@ -48,7 +49,7 @@ vim coordinator.conf
 ## Usage
 
 ```
-./coordinator.sh {poll|watch|notify|reminder|validate|all|init-cron|help}
+./coordinator.sh {poll|watch|notify|reminder|validate|all|init-cron|relay|help}
 ```
 
 ### Subcommands
@@ -62,7 +63,32 @@ vim coordinator.conf
 | `validate` | Validate `status.json` — JSON syntax and required fields |
 | `all` | Run `poll` + `watch` in sequence |
 | `init-cron` | Print recommended system crontab entries |
+| `relay` | Workflow auto handoff — relay task completion to the next agent |
 | `help` | Show usage information |
+
+### Relay Subcommand
+
+The `relay` subcommand handles automatic workflow handoff between agents:
+
+```bash
+# Relay an agent completion to advance the workflow
+./coordinator.sh relay --agent zhugeliang --status completed --work-id TASK-20260528-auto-relay
+
+# With a completion message
+./coordinator.sh relay --agent opencode --status completed --work-id TASK-20260528-auto-relay --message "Coding done, ready for review"
+
+# Via stdin (JSON payload)
+echo '{"agent":"zhugeliang","status":"completed","work_id":"TASK-20260528-auto-relay"}' | ./coordinator.sh relay
+```
+
+**Anti-jump protection** — The relay validates that the reporting agent matches the current in-progress step in `status.json`, preventing out-of-order handoffs.
+
+**Agent notification routing**:
+
+| Agent | Notification Method |
+|-------|-------------------|
+| `caocao`, `simayi`, `caozhi`, `zhugeliang` | `openclaw agent --agent <id> --message` |
+| `opencode` | Notifies `caocao` to `sessions_spawn` opencode |
 
 ### Examples
 
@@ -72,6 +98,9 @@ vim coordinator.conf
 
 # Watch for status.json changes
 ./coordinator.sh watch
+
+# Relay a task completion
+./coordinator.sh relay --agent zhugeliang --status completed --work-id TASK-20260528-auto-relay
 
 # Schedule a reminder at 14:30
 ./coordinator.sh reminder "14:30" "Team standup"
@@ -101,6 +130,9 @@ Configuration is loaded from `coordinator.conf` (or the path in `$COORDINATOR_CO
 | `COORDINATOR_BLOCKER_TIMEOUT` | `30` | Minutes before an agent is considered stale |
 | `COORDINATOR_GIT_BRANCH` | `main` | Git branch for auto-push |
 | `COORDINATOR_NOTIFY_METHOD` | `primary` | Notification channel (primary / webhook / telegram) |
+| `RELAY_WORKFLOW_PATH` | `team-workflow` | Workflow template name (from team-workflow skill) |
+| `RELAY_STATUS_JSON` | *(same as status.json)* | Status JSON path for relay operations |
+| `RELAY_STEPS` | *(empty)* | Step → agentId routing map (optional, pipe-delimited) |
 
 ## Notification Channels
 
@@ -142,19 +174,25 @@ openclaw cron add \
 ## Architecture
 
 ```
-                    ┌──────────────────────┐
-                    │   coordinator.sh      │
-                    │   (core scheduler)    │
-                    └──────┬───────────────┘
-                           │
-            ┌──────────────┼──────────────────┐
-            │              │                  │
-     ┌──────▼──────┐ ┌────▼─────┐    ┌───────▼──────┐
-     │ poll agents │ │ watch    │    │ notify       │
-     │ (sessions)  │ │ status   │    │ (main/       │
-     │             │ │ .json    │    │  webhook/    │
-     │             │ │ → git    │    │  telegram)   │
-     └─────────────┘ └──────────┘    └──────────────┘
+                    ┌──────────────────────────┐
+                    │     coordinator.sh        │
+                    │    (core scheduler)       │
+                    └──────┬────────┬──────────┘
+                           │        │
+            ┌──────────────┼────────┼──────────────────┐
+            │              │        │                  │
+     ┌──────▼──────┐ ┌────▼─────┐  │          ┌───────▼──────┐
+     │ poll agents │ │ watch    │  │          │ notify       │
+     │ (sessions)  │ │ status   │  │          │ (main/       │
+     │             │ │ .json    │  │          │  webhook/    │
+     │             │ │ → git    │  │          │  telegram)   │
+     └─────────────┘ └──────────┘  │          └──────────────┘
+                                   │
+                          ┌────────▼────────┐
+                          │  relay          │
+                          │  (workflow      │
+                          │   auto handoff) │
+                          └─────────────────┘
 ```
 
 ## Integration: validate-status.sh

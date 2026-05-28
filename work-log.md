@@ -1,74 +1,72 @@
-# 工作日志 — 貂蝉编码
+# 工作日志 — 貂蝉编码（第6棒）
 
-**任务**：TASK-20260528-auto-coordinator（第5棒：编码）
+**任务**：TASK-20260528-auto-relay（第6棒：编码）
+**父任务**：TASK-20260528-auto-coordinator
 **日期**：2026-05-28
 **执行人**：貂蝉（opencode）
+**版本号**：v2026.05.28.2
+
+## 前置调研依据
+
+诸葛亮调研报告：`/home/kafei/.openclaw/workspace-zhugeliang/reports/TASK-20260528-auto-relay-调研报告.md`
+
+核心结论：全部可行。relay.conf 角色路由 + status.json step 驱动 + native/ACP 区分通知。
 
 ## 完成内容
 
 ### 交付物清单
 
-| 文件 | 说明 |
-|------|------|
-| `coordinator/coordinator.sh` | 主调度脚本（6个功能模块） |
-| `coordinator/coordinator.conf` | 配置文件 |
-| `coordinator/README.md` | 英文文档（待曹植润色） |
-| `coordinator/work-log.md` | 本日志 |
+| 文件 | 说明 | 状态 |
+|------|------|------|
+| `coordinator/relay.conf` | 角色→Agent映射配置（6角色：曹操/诸葛亮/司马懿/曹植/貂蝉/甄宓） | 新建 |
+| `coordinator/coordinator.conf` | 更新relay配置项（RELAY_CONF, RELAY_DEDUP_TTL） | 修改 |
+| `coordinator/coordinator.sh` | 主调度脚本 — 替换旧relay实现为subcommand架构 | 修改 |
 
-### coordinator.sh 功能模块
+### relay 子命令架构
 
-1. **poll** — Agent 状态轮询
-   - 通过 `openclaw sessions --json | python3` 解析各 Agent 状态
-   - 状态检测：blocked/error/unknown → 触发 blocker 通知
-   - 超时检测：超过 `COORDINATOR_BLOCKER_TIMEOUT`（默认30分钟）未更新 → 告警
-   - 监控 Agent：zhugeliang, caozhi, simayi, opencode
+```
+coordinator.sh relay
+├── check           检测 status.json → 确定下一棒
+├── notify [role]   通知下一棒Agent（自动检测或指定角色）
+├── auto            自动检测+通知（一步完成）
+├── check-session   检测Agent会话是否结束（sessions API）
+└── help            帮助
+```
 
-2. **watch** — status.json 变更检测
-   - SHA-256 哈希比对，检测变更后自动触发 git push
+### 核心设计
 
-3. **notify** — 卡点通知主公
-   - 主通道：`openclaw agent --agent main --message "..."`
-   - 兜底1：OpenClaw Webhook（`127.0.0.1:18789/hooks/agent`）
-   - 兜底2：Telegram Bot API
-   - 三级自动降级
+| 设计点 | 实现方式 |
+|--------|----------|
+| 接力检测 | `relay_find_next()`: 读 status.json steps，找最后一个 `status=completed && reported_next!=true` 的 step |
+| 角色路由 | `relay_lookup_agent()`: 读 relay.conf (ConfigParser) → 返回 agentId + type |
+| Native Agent 通知 | `openclaw agent --agent <id> --message <msg> --deliver --json` |
+| ACP Agent 通知 | 通知曹操(caocao) → 由曹操执行 sessions_spawn |
+| status.json | **只读不写** — relay 检测到接力后，通知甄宓(main)更新 |
+| 去重 | `reported_next` 字段检查 + 本地 `/tmp/coordinator-relay-dedup.txt` 双重保护 |
+| 全部完成 | `relay_signal_all_done()`: 通知甄宓归档 current_task |
+| 超时检测 | `relay_check_session()`: 通过 sessions --json 检查 endedAt |
 
-4. **reminder** — 定时提醒
-   - 支持绝对时间（HH:MM）、相对时间（+10min/+1hour）、ISO 8601 格式
+### 安全机制
 
-5. **validate** — status.json 校验
-   - JSON 语法校验（`python3 -m json.tool`）
-   - 必需字段检查（no_task, last_updated, current_task, steps）
-   - 设计为 validate-status.sh 整合入口
-
-6. **init-cron** — 生成 crontab 配置建议
-
-### 配置项
-
-所有配置通过 `coordinator.conf` 加载，支持环境变量覆盖：
-
-- `COORDINATOR_LOG` — 日志路径（默认 `/var/log/coordinator.log`）
-- `COORDINATOR_STATUS_DIR` — status.json 所在目录
-- `COORDINATOR_AGENTS` — 监控的 Agent 列表
-- `COORDINATOR_BLOCKER_TIMEOUT` — 超时阈值（分钟）
-- 通知通道配置（Telegram Token / Webhook Token）
+1. **reported_next 去重**：只触发 `reported_next!=true` 的 completed step
+2. **本地 dedup 文件**：`/tmp/coordinator-relay-dedup.txt`，记录已执行的接力（TTL: 3600s）
+3. **找不到下一棒**：→ 通知全部完成（`relay_signal_all_done`）
+4. **角色不存在**：→ blocker 通知（`notify_blocker`）
+5. **ACP 失败**：→ blocker 通知（`notify_blocker`）
 
 ## 验证结果
 
-- `bash -n` 语法检查：✅ 通过
-- Python 内联代码语法检查：✅ 通过
-- `status.json` JSON 合法性：✅ 有效
-- `status.json` 必需字段检查：✅ 全部存在
-- `coordinator.sh help` 输出：✅ 正常
-- `coordinator.sh init-cron` 输出：✅ 正常
-
-## 待办
-
-- [ ] 提交司马懿审核
-- [ ] 通知甄宓更新 status.json
-- [ ] GitHub 上传（等曹操下令 + 确认仓库名）
+| 检查项 | 结果 |
+|--------|------|
+| `bash -n coordinator.sh` | ✅ 通过 |
+| relay.conf ConfigParser 解析 | ✅ 通过（6 sections, 含全角括号角色名） |
+| relay_find_next 逻辑对 status.json 实测 | ✅ 通过（completed+reported_next=true → 正确触发 none） |
+| coordinator.sh help 输出 | ✅ 正常 |
+| relay help 输出 | ✅ 正常 |
 
 ## 备注
 
-- `openclaw agent --agent main` 语法需司马懿审核确认
-- 仓库名待确认，GitHub 上传在后续步骤执行
-- validate-status.sh 不存在，已在脚本中预留整合接口
+- 旧 relay 实现（之前未提交的修改）已完整替换：移除了直接写 status.json 的 `relay()` 函数、硬编码的 `assignee_to_agent_id()` 映射、独立的 Python tempfile 写入方案
+- 新实现符合调研设计：relay.conf 路由 + subcommand 架构 + status.json 只读 + 通知甄宓更新
+- 默认 dedup TTL=3600s（1小时），可通过 `RELAY_DEDUP_TTL` 环境变量覆盖
+- 接力 cron 推荐：`*/5 * * * * coordinator.sh relay auto >> $LOG`
