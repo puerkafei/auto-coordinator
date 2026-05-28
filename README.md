@@ -1,8 +1,8 @@
 # Coordinator — Automated Agent Coordination Scheduler
 
-> **Version**: v2026.05.28.2
+> **Version**: v2026.05.29.1
 
-`coordinator.sh` is a shell-based coordination scheduler for OpenClaw multi-agent workflows. It polls agent status, detects `status.json` changes, auto-commits and pushes to git, sends blocker alerts, manages timed reminders, and handles workflow relay (auto handoff between agents).
+`coordinator.sh` is a shell-based coordination scheduler for OpenClaw multi-agent workflows. It polls agent status, detects `status.json` changes, auto-commits and pushes to git, sends blocker alerts, manages timed reminders, handles workflow relay (auto handoff between agents), and orchestrates GitHub uploads (prepare → push → release).
 
 ## Features
 
@@ -12,6 +12,7 @@
 - **Blocker Notification** — Multi-channel alerts via `openclaw agent --agent main`, webhook, and Telegram fallback
 - **Timed Reminders** — Supports absolute time (`HH:MM`), relative time (`+10min`), and ISO 8601 timestamps
 - **Workflow Relay** — Auto handoff between agents on task completion, with anti-jump validation
+- **GitHub Upload** — Four-mode upload pipeline: prepare manifest, git push, create release, or all-in-one auto
 - **Status Validation** — JSON syntax check and required field validation for `status.json`
 - **Cron Integration** — Built-in `init-cron` command generates recommended crontab entries
 
@@ -23,7 +24,7 @@
 | `sha256sum` (coreutils) | Status hash comparison |
 | `python3` | JSON processing & validation |
 | `openclaw` CLI | OpenClaw agent integration |
-| `curl` | Telegram / webhook fallback notifications |
+| `curl` | Telegram / webhook / GitHub API notifications |
 | `jq` | Optional — recommended for JSON parsing |
 
 ## Quick Start
@@ -49,7 +50,7 @@ vim coordinator.conf
 ## Usage
 
 ```
-./coordinator.sh {poll|watch|notify|reminder|validate|all|init-cron|relay|help}
+./coordinator.sh {poll|watch|notify|reminder|validate|all|init-cron|relay|upload|help}
 ```
 
 ### Subcommands
@@ -64,7 +65,56 @@ vim coordinator.conf
 | `all` | Run `poll` + `watch` in sequence |
 | `init-cron` | Print recommended system crontab entries |
 | `relay` | Workflow auto handoff — relay task completion to the next agent |
+| `upload` | GitHub upload pipeline — prepare, push, release, or auto |
 | `help` | Show usage information |
+
+### Upload Subcommand
+
+The `upload` subcommand provides a four-mode pipeline for uploading deliverables to GitHub. Each mode handles a distinct stage of the process.
+
+```
+./coordinator.sh upload {prepare|push|release|auto} [options]
+```
+
+#### Modes
+
+| Mode | Description |
+|------|-------------|
+| `prepare` | Scan working tree and build a file manifest. Sources: `--files` flag, `status.json` manifest, or `git diff` as fallback. Also includes untracked files. Prints the manifest as a comma-separated list. |
+| `push` | Git `add`, `commit`, `tag`, and `push` to remote. Auto-generates tag from work ID or date. Force-updates existing tags. |
+| `release` | Create or update a GitHub Release for the current tag. Uploads manifest files as release assets. Requires `GITHUB_TOKEN`. |
+| `auto` | Convenience mode — runs `prepare` → `push` → `release` in sequence with a single command. |
+
+#### Options
+
+| Option | Applies To | Description |
+|--------|-----------|-------------|
+| `--work-id <id>` | all | Work ID for commit message and tag generation |
+| `--repo <owner/repo>` | release, auto | GitHub repository (auto-detected from git remote if omitted) |
+| `--tag <tag>` | push, release, auto | Custom tag (default: `vYYYY.MM.DD` or `vYYYY.MM.DD-<work-id>`) |
+| `--files <file1,file2,…>` | prepare, auto | Comma-separated file list for the manifest |
+| `--msg <message>` | push, auto | Custom commit message |
+
+#### Examples
+
+```bash
+# Prepare file manifest from status.json
+./coordinator.sh upload prepare
+
+# Prepare with explicit files
+./coordinator.sh upload prepare --files "README.md,coordinator.sh,coordinator.conf"
+
+# Git add, commit, tag, and push
+./coordinator.sh upload push --work-id TASK-20260528-upload-module --msg "Add upload module"
+
+# Create or update GitHub Release
+./coordinator.sh upload release --repo org/repo
+
+# All-in-one: prepare + push + release
+./coordinator.sh upload auto --work-id TASK-20260528-upload-module --msg "Upload coordinator module"
+```
+
+> **Note**: `upload release` and `upload auto` require the `GITHUB_TOKEN` environment variable to be set. The token must have `repo` scope for private repos or `public_repo` scope for public repos.
 
 ### Relay Subcommand
 
@@ -102,6 +152,9 @@ echo '{"agent":"zhugeliang","status":"completed","work_id":"TASK-20260528-auto-r
 # Relay a task completion
 ./coordinator.sh relay --agent zhugeliang --status completed --work-id TASK-20260528-auto-relay
 
+# Upload auto pipeline
+./coordinator.sh upload auto --work-id TASK-20260528-upload-module
+
 # Schedule a reminder at 14:30
 ./coordinator.sh reminder "14:30" "Team standup"
 
@@ -133,6 +186,9 @@ Configuration is loaded from `coordinator.conf` (or the path in `$COORDINATOR_CO
 | `RELAY_WORKFLOW_PATH` | `team-workflow` | Workflow template name (from team-workflow skill) |
 | `RELAY_STATUS_JSON` | *(same as status.json)* | Status JSON path for relay operations |
 | `RELAY_STEPS` | *(empty)* | Step → agentId routing map (optional, pipe-delimited) |
+| `GITHUB_TOKEN` | *(env var)* | GitHub personal access token for release creation |
+
+> **Note**: `GITHUB_TOKEN` is read from the environment, not from `coordinator.conf`. Set it via your shell profile, `.env` file, or CI secrets.
 
 ## Notification Channels
 
@@ -188,11 +244,11 @@ openclaw cron add \
      │             │ │ → git    │  │          │  telegram)   │
      └─────────────┘ └──────────┘  │          └──────────────┘
                                    │
-                          ┌────────▼────────┐
-                          │  relay          │
-                          │  (workflow      │
-                          │   auto handoff) │
-                          └─────────────────┘
+                          ┌────────▼────────┐     ┌──────────────────┐
+                          │  relay          │     │   upload         │
+                          │  (workflow      │     │ (prepare / push  │
+                          │   auto handoff) │     │  / release / auto)│
+                          └─────────────────┘     └──────────────────┘
 ```
 
 ## Integration: validate-status.sh

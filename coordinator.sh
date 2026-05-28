@@ -1,6 +1,6 @@
 #!/bin/bash
 # coordinator.sh — Automated Coordination Scheduler
-# <!-- V5 v2026.05.28.2 -->
+# <!-- V5 v2026.05.29.1 -->
 #
 # Polls agent status, detects status.json changes, commits/pushes to git,
 # sends blocker alerts to the master (主公), and manages timed reminders.
@@ -17,6 +17,7 @@
 #   all         Run poll + watch
 #   init-cron   Print recommended crontab entries
 #   relay       Workflow auto-handoff (agent task relay)
+#   upload      Git push + GitHub Release (prepare|push|release|auto)
 #
 
 set -euo pipefail
@@ -28,7 +29,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
-: "${COORDINATOR_LOG:=/var/log/coordinator.log}"
+: "${COORDINATOR_LOG:=/tmp/coordinator.log}"
 : "${COORDINATOR_STATUS_DIR:=$(dirname "$0")/../team-share}"
 : "${COORDINATOR_STATUS_FILE:=status.json}"
 : "${COORDINATOR_AGENTS:=zhugeliang caozhi simayi opencode}"
@@ -692,6 +693,283 @@ HELP
   esac
 }
 
+# --- 9. UPLOAD — Git Push + GitHub Release (subcommands: prepare | push | release | auto) ---
+
+upload_parse_args() {
+  UPLOAD_WORK_ID=""
+  UPLOAD_REPO=""
+  UPLOAD_TAG=""
+  UPLOAD_FILES=""
+  UPLOAD_MSG=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --work-id) UPLOAD_WORK_ID="$2"; shift 2 ;;
+      --repo)    UPLOAD_REPO="$2"; shift 2 ;;
+      --tag)     UPLOAD_TAG="$2"; shift 2 ;;
+      --files)   UPLOAD_FILES="$2"; shift 2 ;;
+      --msg)     UPLOAD_MSG="$2"; shift 2 ;;
+      *)         break ;;
+    esac
+  done
+}
+
+upload_prepare() {
+  info "upload prepare: preparing file manifest"
+  local manifest_files=""
+
+  if [[ -n "$UPLOAD_FILES" ]]; then
+    manifest_files="$UPLOAD_FILES"
+    info "upload prepare: using --files: ${manifest_files}"
+  elif [[ -f "$STATUS_JSON_PATH" ]]; then
+    info "upload prepare: reading manifest from status.json"
+    manifest_files=$(python3 -c "
+import sys, json
+try:
+    with open('${STATUS_JSON_PATH}') as f:
+        data = json.load(f)
+    manifest = data.get('upload', {}).get('files', [])
+    if not manifest:
+        manifest = data.get('current_task', {}).get('deliverables', [])
+    print(','.join(manifest) if manifest else '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+    if [[ -z "$manifest_files" ]]; then
+      warn "upload prepare: no manifest in status.json, falling back to git diff"
+      manifest_files=$(git diff --name-only 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    fi
+  fi
+
+  local untracked
+  untracked=$(git ls-files --others --exclude-standard 2>/dev/null | head -10 | tr '\n' ',' | sed 's/,$//')
+  if [[ -n "$untracked" ]]; then
+    if [[ -n "$manifest_files" ]]; then
+      manifest_files="${manifest_files},${untracked}"
+    else
+      manifest_files="$untracked"
+    fi
+  fi
+
+  if [[ -z "$manifest_files" ]]; then
+    warn "upload prepare: no files to upload"
+  else
+    info "upload prepare: manifest files: ${manifest_files}"
+  fi
+
+  UPLOAD_FILES="$manifest_files"
+  echo "$manifest_files"
+}
+
+upload_push() {
+  info "upload push: starting git add/commit/tag/push"
+
+  local repo_dir
+  repo_dir="$(cd "$(dirname "$0")" && pwd)"
+
+  # git add
+  git -C "$repo_dir" add -A 2>&1 | tee -a "$COORDINATOR_LOG"
+
+  if git -C "$repo_dir" diff --cached --quiet; then
+    info "upload push: no changes to commit"
+  else
+    local commit_msg="${UPLOAD_MSG:-auto: upload for ${UPLOAD_WORK_ID:-unknown}}"
+    git -C "$repo_dir" commit -m "$commit_msg" 2>&1 | tee -a "$COORDINATOR_LOG"
+    info "upload push: committed changes"
+  fi
+
+  local tag="${UPLOAD_TAG}"
+  if [[ -z "$tag" && -n "$UPLOAD_WORK_ID" ]]; then
+    tag="v$(date +%Y.%m.%d)-${UPLOAD_WORK_ID}"
+  fi
+  if [[ -z "$tag" ]]; then
+    tag="v$(date +%Y.%m.%d)"
+  fi
+
+  if git -C "$repo_dir" tag -l | grep -q "^${tag}$"; then
+    info "upload push: tag '${tag}' exists, force updating"
+    git -C "$repo_dir" tag -f "$tag" 2>&1 | tee -a "$COORDINATOR_LOG"
+  else
+    git -C "$repo_dir" tag "$tag" 2>&1 | tee -a "$COORDINATOR_LOG"
+    info "upload push: created tag '${tag}'"
+  fi
+
+  if git -C "$repo_dir" push origin "$COORDINATOR_GIT_BRANCH" --tags 2>&1 | tee -a "$COORDINATOR_LOG"; then
+    info "upload push: git push successful (branch: ${COORDINATOR_GIT_BRANCH}, tag: ${tag})"
+  else
+    error "upload push: git push failed"
+    return 1
+  fi
+}
+
+upload_release() {
+  info "upload release: processing GitHub Release"
+
+  local token="${GITHUB_TOKEN:-}"
+  if [[ -z "$token" ]]; then
+    error "upload release: GITHUB_TOKEN not set (env var required)"
+    return 1
+  fi
+
+  local repo="${UPLOAD_REPO}"
+  if [[ -z "$repo" ]]; then
+    repo=$(git remote get-url origin 2>/dev/null | sed -n 's|.*github.com[/:]\(.*\)\.git|\1|p')
+    if [[ -z "$repo" ]]; then
+      error "upload release: --repo required or git remote must point to GitHub"
+      return 1
+    fi
+    info "upload release: auto-detected repo: ${repo}"
+  fi
+
+  local tag="${UPLOAD_TAG}"
+  if [[ -z "$tag" ]]; then
+    tag="v$(date +%Y.%m.%d)"
+    info "upload release: auto-generated tag: ${tag}"
+  fi
+
+  local body
+  body="Upload for ${UPLOAD_WORK_ID:-${tag}}"
+  if [[ -n "$UPLOAD_FILES" ]]; then
+    body="${body}\n\nFiles: ${UPLOAD_FILES}"
+  fi
+
+  info "upload release: checking existing release for tag '${tag}'"
+  local existing_release_id
+  existing_release_id=$(curl -s -H "Authorization: token ${token}" \
+    "https://api.github.com/repos/${repo}/releases/tags/${tag}" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || echo "")
+
+  local release_id="$existing_release_id"
+
+  if [[ -n "$existing_release_id" ]]; then
+    info "upload release: updating existing release #${existing_release_id}"
+    local update_result
+    update_result=$(curl -s -X PATCH "https://api.github.com/repos/${repo}/releases/${existing_release_id}" \
+      -H "Authorization: token ${token}" \
+      -H "Content-Type: application/json" \
+      -d "$(python3 -c "
+import json
+d = {'tag_name': '${tag}', 'body': '${body}', 'draft': False, 'prerelease': False}
+print(json.dumps(d))
+")" 2>&1)
+
+    local release_url
+    release_url=$(echo "$update_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))" 2>/dev/null || echo "")
+    info "upload release: updated release at ${release_url}"
+  else
+    info "upload release: creating new release for tag '${tag}'"
+    local create_result
+    create_result=$(curl -s -X POST "https://api.github.com/repos/${repo}/releases" \
+      -H "Authorization: token ${token}" \
+      -H "Content-Type: application/json" \
+      -d "$(python3 -c "
+import json
+d = {'tag_name': '${tag}', 'name': '${tag}', 'body': '${body}', 'draft': False, 'prerelease': False}
+print(json.dumps(d))
+")" 2>&1)
+
+    local release_url
+    release_url=$(echo "$create_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))" 2>/dev/null || echo "")
+    if [[ -n "$release_url" ]]; then
+      info "upload release: created release at ${release_url}"
+      release_id=$(echo "$create_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+    else
+      local err_msg
+      err_msg=$(echo "$create_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','unknown'))" 2>/dev/null || echo "unknown")
+      error "upload release: failed to create release — ${err_msg}"
+      return 1
+    fi
+  fi
+
+  if [[ -n "$UPLOAD_FILES" && -n "$release_id" ]]; then
+    echo "$UPLOAD_FILES" | tr ',' '\n' | while IFS= read -r single_file; do
+      single_file="$(echo "$single_file" | xargs)"
+      if [[ -f "$single_file" ]]; then
+        local filename asset_url
+        filename=$(basename "$single_file")
+        info "upload release: uploading asset '${filename}'"
+        asset_url="https://uploads.github.com/repos/${repo}/releases/${release_id}/assets?name=${filename}"
+        curl -s -X POST "$asset_url" \
+          -H "Authorization: token ${token}" \
+          -H "Content-Type: application/octet-stream" \
+          --data-binary @"$single_file" \
+          &>/dev/null \
+        && info "upload release: uploaded asset '${filename}'" \
+        || warn "upload release: failed to upload '${filename}'"
+      else
+        warn "upload release: asset file not found: ${single_file}"
+      fi
+    done
+  fi
+
+  info "upload release: completed"
+}
+
+upload_auto() {
+  info "upload auto: prepare + push + release (one command)"
+  upload_prepare
+  upload_push
+  upload_release
+}
+
+upload_handler() {
+  local subcmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    prepare|push|release|auto)
+      upload_parse_args "$@"
+      ;;
+  esac
+
+  case "$subcmd" in
+    prepare)
+      upload_prepare
+      ;;
+    push)
+      upload_push
+      ;;
+    release)
+      upload_release
+      ;;
+    auto)
+      upload_auto
+      ;;
+    help|--help|-h)
+      cat <<HELP
+Upload Subcommands:
+  prepare            Prepare file manifest (from --files or status.json)
+  push               Git add/commit/tag/push
+  release            Create/update GitHub Release
+  auto               prepare + push + release (one command)
+  help               Show this help
+
+Options:
+  --work-id <id>     Work ID for commit message & release body
+  --repo <owner/repo> GitHub repository (auto-detected from git remote)
+  --tag <tag>        Git tag (auto-generated if omitted)
+  --files <f1,f2>    Comma-separated file list (auto-detect if omitted)
+  --msg <message>    Commit message (auto-generated if omitted)
+
+Environment:
+  GITHUB_TOKEN       GitHub personal access token (required for release)
+
+Examples:
+  coordinator.sh upload prepare --work-id TASK-123
+  coordinator.sh upload push --tag v2026.05.29 --msg "upload module"
+  coordinator.sh upload release --repo owner/repo --tag v2026.05.29
+  coordinator.sh upload auto --work-id TASK-123 --repo owner/repo
+HELP
+      ;;
+    *)
+      error "Unknown upload subcommand: ${subcmd}"
+      echo "Usage: $0 upload {prepare|push|release|auto|help}"
+      return 1
+      ;;
+  esac
+}
+
 # --- 6. VALIDATE STATUS.JSON (reserved for validate-status.sh integration) --
 validate_status() {
   info "Validating status.json at: ${STATUS_JSON_PATH}"
@@ -809,6 +1087,10 @@ main() {
       shift
       relay_handler "$@"
       ;;
+    upload)
+      shift
+      upload_handler "$@"
+      ;;
     init-cron)
       init_cron
       ;;
@@ -817,7 +1099,7 @@ main() {
 coordinator.sh — Automated Coordination Scheduler
 
 Usage:
-  $(basename "$0") {poll|watch|notify|reminder|validate|all|init-cron|relay|help}
+  $(basename "$0") {poll|watch|notify|reminder|validate|all|init-cron|relay|upload|help}
 
 Subcommands:
   poll              Poll all agents & report status
@@ -828,6 +1110,7 @@ Subcommands:
   all               Run poll + watch
   init-cron         Print recommended crontab entries
   relay             Workflow auto-handoff — see "relay --help"
+  upload            Git push + GitHub Release — see "upload --help"
   help              Show this help message
 
 Relay Subcommands:
@@ -841,6 +1124,22 @@ Relay Notes:
   - ACP agents (opencode) route through caocao for sessions_spawn
   - READ-ONLY on status.json — notifies 甄宓(main) to update
 
+Upload Subcommands:
+  prepare           Prepare file manifest (from --files or status.json)
+  push              Git add/commit/tag/push
+  release           Create/update GitHub Release
+  auto              prepare + push + release (one command)
+
+Upload Options:
+  --work-id <id>    Work ID for commit message & release body
+  --repo <owner/repo>  GitHub repository (auto-detected from git remote)
+  --tag <tag>       Git tag (auto-generated if omitted)
+  --files <f1,f2>   Comma-separated file list (auto-detect if omitted)
+  --msg <message>   Commit message (auto-generated if omitted)
+
+Upload Environment:
+  GITHUB_TOKEN      GitHub personal access token (required for release)
+
 Configuration:
   COORDINATOR_CONFIG    Config file path (default: ./coordinator.conf)
   COORDINATOR_LOG       Log file path (default: /var/log/coordinator.log)
@@ -851,11 +1150,15 @@ Examples:
   $(basename "$0") relay notify
   $(basename "$0") relay auto
   $(basename "$0") relay check-session zhugeliang
+  $(basename "$0") upload prepare --work-id TASK-123
+  $(basename "$0") upload push --tag v2026.05.29
+  $(basename "$0") upload release --repo owner/repo --tag v2026.05.29
+  $(basename "$0") upload auto --work-id TASK-123 --repo owner/repo
 USAGE
       ;;
     *)
       error "Unknown command: ${cmd}"
-      echo "Usage: $(basename "$0") {poll|watch|notify|reminder|validate|all|init-cron|relay|help}"
+      echo "Usage: $(basename "$0") {poll|watch|notify|reminder|validate|all|init-cron|relay|upload|help}"
       exit 1
       ;;
   esac
